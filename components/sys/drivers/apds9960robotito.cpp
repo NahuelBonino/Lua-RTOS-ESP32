@@ -1,6 +1,6 @@
 #include "sdkconfig.h"
 
-#if CONFIG_LUA_RTOS_LUA_USE_APDS9960
+#if CONFIG_LUA_RTOS_LUA_USE_APDS9960R
 
 #ifdef __cplusplus
 extern "C"{
@@ -23,22 +23,30 @@ extern "C"{
   #include "lauxlib.h"
 #endif
 
-#include "apds9960.h"
+#include "apds9960robotito.h"
 #include <drivers/apds9960.h>
+#include <drivers/gpio.h>
 
-//static lua_Number u8_to_100 = 100.0/(2^8);
-//static lua_Number u16_to_100 = 100.0/(2^16);
+static lua_Number u8_to_100 = 100.0/(2^8);
+static lua_Number u16_to_100 = 100.0/(2^16);
 
 static uint8_t stdio;
 
+#define LED_PIN 32
+bool led_on = false;
+uint16_t R_off;
+uint16_t G_off;
+uint16_t B_off;
+uint16_t A_off;
+
 static bool initialized = false;
 
-TimerHandle_t apds9960_color_get_color_timer;
-int apds9960_color_get_rgb_callback = LUA_REFNIL;
-int apds9960_color_get_change_callback = LUA_REFNIL;
+TimerHandle_t apds9960r_color_get_color_timer;
+int apds9960r_color_get_rgb_callback = LUA_REFNIL;
+int apds9960r_color_get_change_callback = LUA_REFNIL;
 
-TimerHandle_t apds9960_proximity_get_thresh_timer;
-int apds9960_proximity_get_thresh_callback = LUA_REFNIL;
+TimerHandle_t apds9960r_proximity_get_thresh_timer;
+int apds9960r_proximity_get_thresh_callback = LUA_REFNIL;
 
 int current_color_i = -1;
 int prev_color_read = -1;
@@ -46,13 +54,9 @@ int saturation_threshold = 0;
 int value_threshold = 0;
 int n_colors = 0;
 color_range *color_ranges;
-
+int min_sat = 50;
 int min_val = 20;
 int max_val = 200;
-
-int delta_h = 10;
-int delta_s = 50;
-int delta_v = 50;
 
 
 int dist_threshold = 0;
@@ -65,25 +69,21 @@ static void RGB2HSV(struct RGB_set RGB, struct HSV_set &HSV);
 
 static int find_color_in_range(int h, int s, int v) {
     if (v < min_val){
-        return COLOR_BLACK_I; //black
-    } else if (v > max_val){
-        return COLOR_WHITE_I; //white
-    } else {
+        return -2; //black
+    }else if (v > max_val){
+        return -3; //white
+    }else if (s > min_sat){
         for (int color_i=0; color_i<n_colors; color_i++) {
-            if (
-                h>=color_ranges[color_i].h-delta_h && h<=color_ranges[color_i].h+delta_h &&
-                s>=color_ranges[color_i].s-delta_s && s<=color_ranges[color_i].s+delta_s &&
-                v>=color_ranges[color_i].v-delta_v && v<=color_ranges[color_i].v+delta_v
-            ) {
+            if (h>=color_ranges[color_i].min && h<=color_ranges[color_i].max) {
                 return color_i;
             }
         }
     }
-    return COLOR_UNKNOWN_I; //unknown
+    return -1; //unknown
 }
 
 
-static int apds9960_set_color_table(lua_State *L){
+static int apds9960r_set_color_table(lua_State *L){
 
     if (lua_type(L,1)!=LUA_TTABLE) {
         lua_pushnil(L);
@@ -108,7 +108,7 @@ static int apds9960_set_color_table(lua_State *L){
             }
 
             size_t str_len;
-            lua_rawgeti(L,-1,1); // first entry
+            lua_rawgeti(L,-1,1);
 
             if (lua_type(L,-1)!=LUA_TSTRING) {
                 lua_pushnil(L);
@@ -121,19 +121,15 @@ static int apds9960_set_color_table(lua_State *L){
             lua_pop(L,1);
 
 
-            lua_rawgeti(L,-1,2); // second entry
-            color_ranges[i-1].h = lua_tointeger(L,-1);
+            lua_rawgeti(L,-1,2); // first entry
+            color_ranges[i-1].min = lua_tointeger(L,-1);
             lua_pop(L,1);
 
-            lua_rawgeti(L,-1,3); // third entry
-            color_ranges[i-1].s = lua_tointeger(L,-1);
+            lua_rawgeti(L,-1,3); // first entry
+            color_ranges[i-1].max = lua_tointeger(L,-1);
             lua_pop(L,1);
 
-            lua_rawgeti(L,-1,4); // fourth entry
-            color_ranges[i-1].v = lua_tointeger(L,-1);
-            lua_pop(L,1);
-            
-            printf("Added -> color = %s, (h,s,v) = (%i,%i,%i)\r\n", color_ranges[i-1].name, color_ranges[i-1].h, color_ranges[i-1].s,color_ranges[i-1].v);
+            printf("Added -> color = %s, min = %i , max = %i\r\n", color_ranges[i-1].name, color_ranges[i-1].min, color_ranges[i-1].max);
 
         }
         lua_pop(L, 1); // pop entry
@@ -142,21 +138,16 @@ static int apds9960_set_color_table(lua_State *L){
     return 1;
 }
 
-static int apds9960_set_sv_limits (lua_State *L) {
-    delta_h = luaL_checkinteger( L, 1 );
-    delta_s = luaL_checkinteger( L, 2 );
-    delta_v = luaL_checkinteger( L, 3 );
-    min_val = luaL_optinteger( L, 4, min_val );
-    max_val = luaL_optinteger( L, 5, max_val );
-    
-    printf("Color limits set dh=%i ds=%i dv=%i minv=%i maxv=%i\r\n",delta_h, delta_s, delta_v, min_val, max_val);
-       
-    lua_pushboolean(L, true);
-    return 1;
+static int apds9960r_set_sv_limits (lua_State *L) {
+  min_sat = luaL_checkinteger( L, 1 );
+  min_val = luaL_checkinteger( L, 2 );
+  max_val = luaL_checkinteger( L, 3 );
+  lua_pushboolean(L, true);
+  return 1;
 }
 
 /*
-static int apds9960_rgb2hsvcolor (lua_State *L) {
+static int apds9960r_rgb2hsvcolor (lua_State *L) {
     HSV_set hsv;
     RGB_set rgb;
     rgb.r = luaL_checkinteger( L, 1 ); //R<<8;
@@ -215,6 +206,23 @@ static void callback_sw_get_color(TimerHandle_t xTimer) {
 
     int status;
     if (ok) {
+      
+        //toggle led, skip after "off" reading
+        if (led_on == false) {
+            R_off = R;
+            G_off = G;
+            B_off = B;
+            A_off = A;
+            gpio_pin_set(LED_PIN);
+            led_on = true;          
+            return;
+        }
+        gpio_pin_clr(LED_PIN);
+        led_on = false;
+        if (R>R_off) R = R-R_off;
+        if (G>G_off) G = G-G_off;
+        if (B>B_off) B = B-B_off;
+        if (A>A_off) A = A-A_off;
         
         HSV_set hsv;
         RGB_set rgb;
@@ -226,13 +234,13 @@ static void callback_sw_get_color(TimerHandle_t xTimer) {
         
         
         ////////////
-        if (apds9960_color_get_rgb_callback!=LUA_REFNIL) {
+        if (apds9960r_color_get_rgb_callback!=LUA_REFNIL) {
             L = pvGetLuaState();
             TL = lua_newthread(L);
 
             tref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-            lua_rawgeti(L, LUA_REGISTRYINDEX, apds9960_color_get_rgb_callback);
+            lua_rawgeti(L, LUA_REGISTRYINDEX, apds9960r_color_get_rgb_callback);
             lua_xmove(L, TL, 1);
                
             /*
@@ -252,7 +260,16 @@ static void callback_sw_get_color(TimerHandle_t xTimer) {
             lua_pushinteger(TL, hsv.h);
             lua_pushinteger(TL, hsv.s);
             lua_pushinteger(TL, hsv.v);
-            status = lua_pcall(TL, 7, 0, 0);
+            
+            /////M
+            lua_pushinteger(TL, R_off);
+            lua_pushinteger(TL, G_off);
+            lua_pushinteger(TL, B_off);
+            /////M
+            
+            //status = lua_pcall(TL, 7, 0, 0);/////M
+            status = lua_pcall(TL, 7+3, 0, 0);/////M
+            
             luaL_unref(TL, LUA_REGISTRYINDEX, tref);
             if (status != LUA_OK) {
 		        const char *msg = lua_tostring(TL, -1);
@@ -273,22 +290,22 @@ static void callback_sw_get_color(TimerHandle_t xTimer) {
         int color_i = find_color_in_range(hsv.h, hsv.s, hsv.v);
         //printf("----current_color_i %i    color_i %i    prev_color_read %i\r\n", current_color_i, color_i, prev_color_read);
 
-        if (apds9960_color_get_change_callback!=LUA_REFNIL && color_i!=current_color_i && prev_color_read == color_i) {
+        if (apds9960r_color_get_change_callback!=LUA_REFNIL && color_i!=current_color_i && prev_color_read == color_i) {
             current_color_i = color_i;
 
             //prepare thread
             L = pvGetLuaState();
             TL = lua_newthread(L);
             tref = luaL_ref(L, LUA_REGISTRYINDEX);
-            lua_rawgeti(L, LUA_REGISTRYINDEX, apds9960_color_get_change_callback);
+            lua_rawgeti(L, LUA_REGISTRYINDEX, apds9960r_color_get_change_callback);
             lua_xmove(L, TL, 1);
 
             if (color_i >= 0){
               lua_pushstring(TL, color_ranges[color_i].name);
             }else{
-              if (color_i == COLOR_WHITE_I){
+              if (color_i == -3){
                 lua_pushstring(TL, COLOR_WHITE);
-              }else if (color_i == COLOR_BLACK_I){
+              }else if (color_i == -2){
                 lua_pushstring(TL, COLOR_BLACK);
               }else{
                 lua_pushstring(TL, COLOR_UNKNOWN);
@@ -327,7 +344,7 @@ printf("Error in sensor.readColor: %i", ok);
         L = pvGetLuaState();
         TL = lua_newthread(L);
         tref = luaL_ref(L, LUA_REGISTRYINDEX);
-        lua_rawgeti(L, LUA_REGISTRYINDEX, apds9960_color_get_change_callback);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, apds9960r_color_get_change_callback);
         lua_xmove(L, TL, 1);
 
         lua_pushnil(TL);
@@ -347,13 +364,20 @@ printf("Error in sensor.readColor: %i", ok);
     
 }
 
-static int apds9960_init (lua_State *L) {
+static int apds9960r_init (lua_State *L) {
+	driver_error_t *error;
     if (!initialized) {
         bool ok = sensor.init();
         if (!ok) {
             lua_pushnil(L);
             lua_pushstring(L, "init failed");
             return 2;
+        }
+        if ((error = gpio_pin_output(LED_PIN))) {
+            lua_pushnil(L);
+            lua_pushstring(L, "error setting pin to out");
+            lua_pushinteger(L, LED_PIN);
+            return 3;
         }
         ok = sensor.enablePower();
         if (!ok) {
@@ -368,7 +392,7 @@ static int apds9960_init (lua_State *L) {
     return 1;
 }
 
-static int apds9960_enable_power (lua_State *L) {
+static int apds9960r_enable_power (lua_State *L) {
     bool enable = lua_gettop(L)==0 || lua_toboolean( L, 1 );
     bool ok;
     if (enable) {
@@ -387,7 +411,7 @@ static int apds9960_enable_power (lua_State *L) {
 }
 
 
-static int apds9960_color_set_ambient_gain (lua_State *L) {
+static int apds9960r_color_set_ambient_gain (lua_State *L) {
     bool gain = lua_tointeger( L, 1 );
     bool ok;
     ok = sensor.setAmbientLightGain(gain);
@@ -401,7 +425,7 @@ static int apds9960_color_set_ambient_gain (lua_State *L) {
     return 1;
 }
 
-static int apds9960_set_LED_drive (lua_State *L) {
+static int apds9960r_set_LED_drive (lua_State *L) {
     bool drive = lua_tointeger( L, 1 );
     bool ok;
     ok = sensor.setLEDDrive(drive);
@@ -447,7 +471,7 @@ static void callback_dist_get_dist_thresh(TimerHandle_t xTimer) {
            L = pvGetLuaState();
            TL = lua_newthread(L);
            tref = luaL_ref(L, LUA_REGISTRYINDEX);
-           lua_rawgeti(L, LUA_REGISTRYINDEX, apds9960_proximity_get_thresh_callback);
+           lua_rawgeti(L, LUA_REGISTRYINDEX, apds9960r_proximity_get_thresh_callback);
            lua_xmove(L, TL, 1);
 
            lua_pushboolean(TL, prev_state);
@@ -464,7 +488,7 @@ static void callback_dist_get_dist_thresh(TimerHandle_t xTimer) {
         L = pvGetLuaState();
         TL = lua_newthread(L);
         tref = luaL_ref(L, LUA_REGISTRYINDEX);
-        lua_rawgeti(L, LUA_REGISTRYINDEX, apds9960_proximity_get_thresh_callback);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, apds9960r_proximity_get_thresh_callback);
         lua_xmove(L, TL, 1);
 
         lua_pushnil(TL);
@@ -481,38 +505,38 @@ static void callback_dist_get_dist_thresh(TimerHandle_t xTimer) {
     }
 }
 
-static int apds9960_color_get_change (lua_State *L) {
+static int apds9960r_color_get_change (lua_State *L) {
     bool enable = lua_toboolean(L, 1);
     if (enable) {
 	    luaL_checktype(L, 1, LUA_TFUNCTION);
         lua_pushvalue(L, 1);
-        apds9960_color_get_change_callback = luaL_ref(L, LUA_REGISTRYINDEX);
+        apds9960r_color_get_change_callback = luaL_ref(L, LUA_REGISTRYINDEX);
     } else {
-        if (apds9960_color_get_change_callback==LUA_REFNIL) {
+        if (apds9960r_color_get_change_callback==LUA_REFNIL) {
             lua_pushnil(L);
             lua_pushstring(L, "no continuos get running");
             return 2;
         }
-        apds9960_color_get_change_callback = LUA_REFNIL;
+        apds9960r_color_get_change_callback = LUA_REFNIL;
     }
 
     lua_pushboolean(L, true);
 	return 1;
 }
 
-static int apds9960_color_get_continuous (lua_State *L) {
+static int apds9960r_color_get_continuous (lua_State *L) {
     bool enable = lua_toboolean(L, 1);
     if (enable) {
 	    luaL_checktype(L, 1, LUA_TFUNCTION);
         lua_pushvalue(L, 1);
-        apds9960_color_get_rgb_callback = luaL_ref(L, LUA_REGISTRYINDEX);
+        apds9960r_color_get_rgb_callback = luaL_ref(L, LUA_REGISTRYINDEX);
     } else {
-        if (apds9960_color_get_rgb_callback==LUA_REFNIL) {
+        if (apds9960r_color_get_rgb_callback==LUA_REFNIL) {
             lua_pushnil(L);
             lua_pushstring(L, "no continuos get running");
             return 2;
         }
-        apds9960_color_get_rgb_callback = LUA_REFNIL;
+        apds9960r_color_get_rgb_callback = LUA_REFNIL;
     }
 
     lua_pushboolean(L, true);
@@ -520,19 +544,19 @@ static int apds9960_color_get_continuous (lua_State *L) {
 }
 
 
-static int apds9960_proximity_get_thresh (lua_State *L) {
+static int apds9960r_proximity_get_thresh (lua_State *L) {
     bool enable = lua_toboolean(L, 1);
     if (enable) {
         luaL_checktype(L, 1, LUA_TFUNCTION);
         lua_pushvalue(L, 1);
-        apds9960_proximity_get_thresh_callback = luaL_ref(L, LUA_REGISTRYINDEX);
+        apds9960r_proximity_get_thresh_callback = luaL_ref(L, LUA_REGISTRYINDEX);
     } else {
-        if (apds9960_proximity_get_thresh_callback==LUA_REFNIL) {
+        if (apds9960r_proximity_get_thresh_callback==LUA_REFNIL) {
             lua_pushnil(L);
             lua_pushstring(L, "no proximity get running");
             return 2;
         }
-        apds9960_proximity_get_thresh_callback = LUA_REFNIL;
+        apds9960r_proximity_get_thresh_callback = LUA_REFNIL;
     }
 
     lua_pushboolean(L, true);
@@ -540,7 +564,7 @@ static int apds9960_proximity_get_thresh (lua_State *L) {
 }
 
 
-static int apds9960_proximity_enable (lua_State *L) {
+static int apds9960r_proximity_enable (lua_State *L) {
     bool enable = lua_toboolean(L, 1);
     if (enable) {
         uint32_t millis = luaL_checkinteger( L, 1 );
@@ -571,9 +595,9 @@ static int apds9960_proximity_enable (lua_State *L) {
 	    }
 	    
         //set timer for callback
-        apds9960_proximity_get_thresh_timer = xTimerCreate("apds_prox", millis / portTICK_PERIOD_MS, pdTRUE,
-            (void *)apds9960_proximity_get_thresh_timer, callback_dist_get_dist_thresh);
-        xTimerStart(apds9960_proximity_get_thresh_timer, 0);
+        apds9960r_proximity_get_thresh_timer = xTimerCreate("apds_prox", millis / portTICK_PERIOD_MS, pdTRUE,
+            (void *)apds9960r_proximity_get_thresh_timer, callback_dist_get_dist_thresh);
+        xTimerStart(apds9960r_proximity_get_thresh_timer, 0);
     } else {
 
 	    if (!sensor.disableProximitySensor()) {
@@ -583,9 +607,9 @@ static int apds9960_proximity_enable (lua_State *L) {
 	    }
 
         //delete timer
-        xTimerStop(apds9960_proximity_get_thresh_timer, portMAX_DELAY);
-	      xTimerDelete(apds9960_proximity_get_thresh_timer, portMAX_DELAY);
-        apds9960_proximity_get_thresh_callback = LUA_REFNIL;
+        xTimerStop(apds9960r_proximity_get_thresh_timer, portMAX_DELAY);
+	      xTimerDelete(apds9960r_proximity_get_thresh_timer, portMAX_DELAY);
+        apds9960r_proximity_get_thresh_callback = LUA_REFNIL;
     }
 
     lua_pushboolean(L, true);
@@ -593,7 +617,10 @@ static int apds9960_proximity_enable (lua_State *L) {
 }
 
 
-static int apds9960_color_enable (lua_State *L) {
+static int apds9960r_color_enable (lua_State *L) {
+    gpio_pin_clr(LED_PIN);
+    led_on = false;
+
     bool enable = lua_toboolean(L, 1);
     if (enable) {
         uint32_t millis = luaL_checkinteger( L, 1 );
@@ -610,9 +637,9 @@ static int apds9960_color_enable (lua_State *L) {
         }
 
         //set timer for callback
-        apds9960_color_get_color_timer = xTimerCreate("apds_color", millis / portTICK_PERIOD_MS, pdTRUE,
-            (void *)apds9960_color_get_color_timer, callback_sw_get_color);
-        xTimerStart(apds9960_color_get_color_timer, 0);
+        apds9960r_color_get_color_timer = xTimerCreate("apds_color", millis / portTICK_PERIOD_MS, pdTRUE,
+            (void *)apds9960r_color_get_color_timer, callback_sw_get_color);
+        xTimerStart(apds9960r_color_get_color_timer, 0);
     } else {
 
         if (!sensor.disableLightSensor() ) {
@@ -622,8 +649,8 @@ static int apds9960_color_enable (lua_State *L) {
         }
 
         //delete timer
-        xTimerStop(apds9960_color_get_color_timer, portMAX_DELAY);
-		xTimerDelete(apds9960_color_get_color_timer, portMAX_DELAY);
+        xTimerStop(apds9960r_color_get_color_timer, portMAX_DELAY);
+		xTimerDelete(apds9960r_color_get_color_timer, portMAX_DELAY);
     }
 
     lua_pushboolean(L, true);
@@ -645,7 +672,7 @@ static int apds9960_color_enable (lua_State *L) {
  *   - NB: if s == 0, then h = 0 (undefined)
  ******************************************************************************/
 static void RGB2HSV(struct RGB_set RGB, struct HSV_set &HSV){
-    uint16_t min, max, delta;
+    unsigned char min, max, delta;
 
     if(RGB.r<RGB.g)min=RGB.r; else min=RGB.g;
     if(RGB.b<min)min=RGB.b;
@@ -653,12 +680,12 @@ static void RGB2HSV(struct RGB_set RGB, struct HSV_set &HSV){
     if(RGB.r>RGB.g)max=RGB.r; else max=RGB.g;
     if(RGB.b>max)max=RGB.b;
 
-    HSV.v = max;                // v, 16bit
+    HSV.v = max;                // v, 0..255
 
-    delta = max - min;          // 16bit, < v
+    delta = max - min;          // 0..255, < v
 
     if( max != 0 )
-        HSV.s = (int)(delta)*2^16 / max;        // s, 16bit
+        HSV.s = (int)(delta)*255 / max;        // s, 0..255
     else {
         // r = g = b = 0        // s = 0, v is undefined
         HSV.s = 0;
@@ -681,48 +708,48 @@ static void RGB2HSV(struct RGB_set RGB, struct HSV_set &HSV){
 
 
 static const luaL_Reg apds9960[] = {
-    {"init", apds9960_init},
-	{"enable_power", apds9960_enable_power},
-	{"set_LED_drive", apds9960_set_LED_drive},
+    {"init", apds9960r_init},
+	{"enable_power", apds9960r_enable_power},
+	{"set_LED_drive", apds9960r_set_LED_drive},
     {NULL, NULL}
 };
 
 
-static const luaL_Reg apds9960_color[] = {
-    {"enable", apds9960_color_enable},
-    {"set_rgb_callback", apds9960_color_get_continuous},
-    {"set_color_callback", apds9960_color_get_change},
-    {"set_ambient_gain", apds9960_color_set_ambient_gain},
-    {"set_color_table", apds9960_set_color_table},
-    {"set_sv_limits", apds9960_set_sv_limits},
-    //{"rgb2hsvcolor", apds9960_rgb2hsvcolor},
+static const luaL_Reg apds9960r_color[] = {
+    {"enable", apds9960r_color_enable},
+    {"set_rgb_callback", apds9960r_color_get_continuous},
+    {"set_color_callback", apds9960r_color_get_change},
+    {"set_ambient_gain", apds9960r_color_set_ambient_gain},
+    {"set_color_table", apds9960r_set_color_table},
+    {"set_sv_limits", apds9960r_set_sv_limits},
+    //{"rgb2hsvcolor", apds9960r_rgb2hsvcolor},
     {NULL, NULL}
 };
 
-static const luaL_Reg apds9960_proximity[] = {
-    {"enable", apds9960_proximity_enable},
-    {"set_callback", apds9960_proximity_get_thresh},
+static const luaL_Reg apds9960r_proximity[] = {
+    {"enable", apds9960r_proximity_enable},
+    {"set_callback", apds9960r_proximity_get_thresh},
     {NULL, NULL}
 };
 
 
-LUALIB_API int luaopen_apds9960( lua_State *L ) {
+LUALIB_API int luaopen_apds9960r( lua_State *L ) {
 
     //register
     luaL_newlib(L, apds9960);
 
     lua_newtable(L);
-    luaL_setfuncs((L), apds9960_color, 0);
+    luaL_setfuncs((L), apds9960r_color, 0);
     lua_setfield(L, -2, "color");
 
     lua_newtable(L);
-    luaL_setfuncs((L), apds9960_proximity, 0);
+    luaL_setfuncs((L), apds9960r_proximity, 0);
     lua_setfield(L, -2, "proximity");
 
 	return 1;
 }
 
-MODULE_REGISTER_RAM(APDS9960, apds9960, luaopen_apds9960, 1);
+MODULE_REGISTER_RAM(APDS9960R, apds9960r, luaopen_apds9960r, 1);
 
 #ifdef __cplusplus
 }
