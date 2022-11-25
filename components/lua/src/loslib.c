@@ -478,6 +478,10 @@ static int os_exit (lua_State *L) {
   return 0;
 }
 
+static int os_gettime(lua_State *L){ 
+  lua_pushnumber(L, (uint16_t)(esp_timer_get_time()/1000));
+  return 1; 
+}
 
 #include "modules.h"
 
@@ -490,6 +494,7 @@ static const LUA_REG_TYPE syslib[] =
   { LSTRKEY( "rename" ),      LFUNCVAL( os_rename ) },
   { LSTRKEY( "time" ),        LFUNCVAL( os_time ) },
   { LSTRKEY( "settime" ),     LFUNCVAL( os_settime ) },
+  { LSTRKEY( "gettime" ),     LFUNCVAL( os_gettime ) },
   { LSTRKEY( "tmpname" ),     LFUNCVAL( os_tmpname ) },
   { LSTRKEY( "exit" ),        LFUNCVAL( os_exit ) },
   { LSTRKEY( "execute" ),     LFUNCVAL( os_execute ) },
